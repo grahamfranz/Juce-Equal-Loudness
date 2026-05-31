@@ -1,5 +1,7 @@
 # juce_equal_loudness
 
+[![CI](https://github.com/grahamfranz/Juce-Equal-Loudness/actions/workflows/ci.yml/badge.svg)](https://github.com/grahamfranz/Juce-Equal-Loudness/actions/workflows/ci.yml)
+
 A small JUCE module that applies real-time equal-loudness compensation based
 on the ISO 226:2003 standard.
 
