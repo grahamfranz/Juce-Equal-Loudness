@@ -187,6 +187,57 @@ TEST_F (ProcessorTest, ChangingPhonLevelDoesNotCrashDuringProcessing)
     }
 }
 
+TEST_F (ProcessorTest, CascadeMatchesTargetAtDesignFrequenciesAcrossPhonRange)
+{
+    // The iterative cascade design should pin the realised magnitude
+    // response to within ~1.5 dB of the analytic target at each of the
+    // 8 design frequencies. This is the regression test for the iterative
+    // residual-correction loop in updateFilters(); without it, the naive
+    // per-band design overshoots by 5-10 dB between adjacent filters.
+    const std::array<float, 8> designFreqs {
+        50.0f, 125.0f, 250.0f, 500.0f, 2000.0f, 4000.0f, 6300.0f, 10000.0f
+    };
+
+    constexpr int   sineSamples = 16384;
+    constexpr float toleranceDb = 1.5f;
+
+    for (float phon : { 30.0f, 60.0f, 90.0f })
+    {
+        proc.setPhonLevel (phon);
+
+        for (float f : designFreqs)
+        {
+            const float targetDb = proc.gainAtFrequency (f);
+
+            juce::AudioBuffer<float> buffer (1, sineSamples);
+            const float twoPi = juce::MathConstants<float>::twoPi;
+            for (int i = 0; i < sineSamples; ++i)
+                buffer.setSample (0, i, std::sin (twoPi * f * (float) i / 48000.0f));
+
+            // Measure dry RMS.
+            float dryRms = 0.0f;
+            for (int i = 0; i < sineSamples; ++i)
+                dryRms += buffer.getSample (0, i) * buffer.getSample (0, i);
+            dryRms = std::sqrt (dryRms / sineSamples);
+
+            proc.reset();
+            proc.process (buffer);
+
+            // Skip the first quarter of samples to let the filter settle.
+            float wetRms = 0.0f;
+            const int skip = sineSamples / 4;
+            for (int i = skip; i < sineSamples; ++i)
+                wetRms += buffer.getSample (0, i) * buffer.getSample (0, i);
+            wetRms = std::sqrt (wetRms / (sineSamples - skip));
+
+            const float realisedDb = 20.0f * std::log10 (wetRms / dryRms);
+
+            EXPECT_NEAR (realisedDb, targetDb, toleranceDb)
+                << "phon=" << phon << " freq=" << f;
+        }
+    }
+}
+
 TEST_F (ProcessorTest, ResetClearsFilterState)
 {
     juce::AudioBuffer<float> buffer (2, 512);

@@ -92,6 +92,43 @@ namespace
             a2 / a0
         };
     }
+
+    // Squared magnitude response of one biquad at angular frequency w.
+    //
+    // We compute |N(e^jw)|^2 and |D(e^jw)|^2 directly as (real)^2 + (imag)^2
+    // rather than via the algebraically simpler expansion in cos(w) / cos(2w):
+    // at very low w (e.g. a 50 Hz design freq at 48 kHz, w ≈ 0.0065 rad) the
+    // expanded form sums three near-cancelling O(1) terms and loses almost
+    // all precision, producing a small negative denominator and a NaN gain.
+    // The (real)^2 + (imag)^2 form keeps the contributions individually small
+    // and is well-conditioned everywhere in the audio band.
+    double biquadMagSq (const EqualLoudnessProcessor::BiquadCoeffs& c, double w) noexcept
+    {
+        const double cosW  = std::cos (w);
+        const double sinW  = std::sin (w);
+        const double cos2W = std::cos (2.0 * w);
+        const double sin2W = std::sin (2.0 * w);
+
+        const double nRe = c.b0 + c.b1 * cosW + c.b2 * cos2W;
+        const double nIm =       -c.b1 * sinW - c.b2 * sin2W;
+        const double dRe = 1.0  + c.a1 * cosW + c.a2 * cos2W;
+        const double dIm =       -c.a1 * sinW - c.a2 * sin2W;
+
+        return (nRe * nRe + nIm * nIm) / (dRe * dRe + dIm * dIm);
+    }
+
+    // Combined magnitude response of the full cascade at frequency f, in dB.
+    float cascadeGainDb (const std::array<EqualLoudnessProcessor::BiquadCoeffs,
+                                          EqualLoudnessProcessor::numBiquads>& coeffs,
+                         float f,
+                         double sampleRate) noexcept
+    {
+        const double w = juce::MathConstants<double>::twoPi * f / sampleRate;
+        double magSq = 1.0;
+        for (const auto& c : coeffs)
+            magSq *= biquadMagSq (c, w);
+        return (float) (10.0 * std::log10 (magSq));
+    }
 }
 
 //==============================================================================
@@ -123,11 +160,55 @@ void EqualLoudnessProcessor::setPhonLevel (float phon) noexcept
 
 void EqualLoudnessProcessor::updateFilters() noexcept
 {
+    // The cascade design is iterative residual correction. A naive
+    // independent-per-band fit overshoots between design frequencies because
+    // each peaking filter's skirts contribute gain at its neighbours' centre
+    // frequencies, and that crosstalk adds up. We compensate by repeatedly
+    // measuring the realised cascade response at each design frequency,
+    // subtracting from the target, and folding the residual back into the
+    // filter gain.
+    std::array<float, numBiquads> targetDb {};
     for (int i = 0; i < numBiquads; ++i)
+        targetDb[(size_t) i] = ISO226::splAtFrequency (designFrequencies[(size_t) i],
+                                                       phonLevel_) - phonLevel_;
+
+    std::array<float, numBiquads> filterGainDb = targetDb;
+
+    auto redesign = [this, &filterGainDb]
     {
-        const float f = designFrequencies[(size_t) i];
-        const float gain = ISO226::splAtFrequency (f, phonLevel_) - phonLevel_;
-        coeffs_[(size_t) i] = designPeakingFilter (f, gain, designQ, sampleRate_);
+        for (int i = 0; i < numBiquads; ++i)
+            coeffs_[(size_t) i] = designPeakingFilter (designFrequencies[(size_t) i],
+                                                       filterGainDb[(size_t) i],
+                                                       designQ,
+                                                       sampleRate_);
+    };
+
+    redesign();
+
+    // Damping factor < 1 trades convergence speed for stability. At full
+    // strength (1.0) the iteration overshoots when target gains are large
+    // (e.g. +30 dB at 50 Hz, low phon levels): the corrected coefficients
+    // produce deep notches elsewhere in the cascade, the realised response
+    // collapses, and the next residual blows up. 0.5 converges in ~15
+    // iterations and stays well-behaved over the full ISO 226 phon range.
+    constexpr int   maxIterations = 20;
+    constexpr float damping       = 0.5f;
+    constexpr float convergenceDb = 0.05f;
+
+    for (int iter = 0; iter < maxIterations; ++iter)
+    {
+        float maxResidual = 0.0f;
+        for (int i = 0; i < numBiquads; ++i)
+        {
+            const float realisedDb = cascadeGainDb (coeffs_,
+                                                    designFrequencies[(size_t) i],
+                                                    sampleRate_);
+            const float residual = targetDb[(size_t) i] - realisedDb;
+            filterGainDb[(size_t) i] += damping * residual;
+            maxResidual = juce::jmax (maxResidual, std::abs (residual));
+        }
+        redesign();
+        if (maxResidual < convergenceDb) break;
     }
 }
 
