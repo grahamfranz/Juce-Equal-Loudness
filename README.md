@@ -1,18 +1,32 @@
 # juce_equal_loudness
 
-A small JUCE module that applies ISO 226:2003 equal-loudness compensation as a
-real-time IIR peaking-filter cascade.
+A small JUCE module that applies real-time equal-loudness compensation based
+on the ISO 226:2003 standard.
 
-**Status: v0.1.** Single mode, single direction, no parameter smoothing. See
-[Scope and limitations](#scope-and-limitations) before depending on it.
+**Status: v0.1.** See [Scope and limitations](#scope-and-limitations) before
+depending on it.
 
-## What it does
+## Why this exists
 
-Given a phon level `Ln`, the processor builds an 8-band peaking-filter cascade
-whose magnitude response approximates the inverse of the ISO 226:2003
-equal-loudness contour at `Ln`, normalised to 0 dB at 1 kHz. Audio passed
-through this filter is shaped so that flat-spectrum input is perceived as
-spectrally balanced by a listener whose ear is operating at that phon level.
+Human hearing isn't equally sensitive to all frequencies. At quiet listening
+levels in particular, the ear's response to bass and high treble falls off
+much faster than its response to the midrange — which is why music turned
+down sounds thinner and less full, not just quieter. The ISO 226:2003
+standard describes this frequency-dependent sensitivity numerically. This
+module applies its inverse as a real-time EQ, so that flat-spectrum audio is
+shaped to sound spectrally balanced to the ear at a chosen listening level.
+
+Listening level is parameterised in **phon**. The phon is the standard
+perceived-loudness unit: a sound is X phon when it sounds as loud to the ear
+as an X dB-SPL tone at 1 kHz. Typical levels: conversation around 60 phon,
+loud music around 90.
+
+## How it works
+
+Given a phon level `Ln`, the processor builds an 8-band cascade of IIR
+peaking filters whose combined magnitude response approximates the inverse
+of the ISO 226:2003 equal-loudness contour at `Ln`, normalised to 0 dB at
+1 kHz.
 
 ## ISO 226 data
 
@@ -79,27 +93,26 @@ void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
 
 ## Scope and limitations
 
-This is deliberately a small first release. Things it explicitly does not do:
+This is a small first release. Known limitations:
 
 - **No parameter smoothing.** Changing `setPhonLevel` during playback may
-  produce an audible click as the biquad coefficients jump. Either change the
-  parameter only between blocks from the message thread, or smooth it
+  produce an audible click as the biquad coefficients jump. Either change
+  the parameter only between blocks from the message thread, or smooth it
   externally and call once per block.
 - **One direction.** Applies the inverse equal-loudness contour. There is no
   "reference vs target" mode and no flatten/inverse switch.
-- **One sample type.** `float` only.
-- **Eight biquads, fixed.** No way to trade quality for CPU; no FIR mode.
-- **Phon range 20–90.** The ISO 226:2003 formula is only validated over this
+- **`float` samples only.** `double` is not supported.
+- **Fixed 8-biquad cascade.** No way to trade quality for CPU; no FIR mode.
+- **Phon range 20–90.** ISO 226:2003 only validates the formula over this
   range. `setPhonLevel` clamps to it.
-- **Large gains at low phon levels.** At e.g. 30 phon, the bass boost
-  required to invert the contour exceeds 25 dB. The cascade applies it
-  honestly; if you need it tame, use it with output gain compensation or a
-  limiter, or restrict the phon range your UI exposes.
-- **No headphone vs free-field option.** ISO 226 is the diffuse-field /
-  free-field standard contour.
+- **Large gains at low phon levels.** At 30 phon the bass boost required to
+  invert the contour exceeds 25 dB. The processor applies the full gain; if
+  you need it tame, add output gain compensation, a limiter, or restrict the
+  phon range exposed in your UI.
+- **Free-field contour only.** ISO 226 defines the free-field / diffuse-field
+  contour; there is no separate headphone mode.
 
-If any of these matter to you, file an issue and the design conversation can
-happen in the open.
+If any of these matter to you, open an issue.
 
 ## References
 
