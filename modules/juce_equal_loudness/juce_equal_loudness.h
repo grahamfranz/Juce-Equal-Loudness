@@ -5,7 +5,7 @@
 
     ID:                 juce_equal_loudness
     vendor:             Graham Franz
-    version:            0.1.0
+    version:            0.1.1
     name:               JUCE Equal Loudness
     description:        Real-time ISO 226:2003 equal-loudness compensation via an IIR peaking-filter cascade.
     website:            https://github.com/grahamfranz/Juce-Equal-Loudness
@@ -101,6 +101,9 @@ struct ISO226
 //     setPhonLevel() do not.
 //   - The filter cascade has a fixed size (numBiquads). Changing the phon
 //     level updates coefficients in place; it does not resize.
+//   - setPhonLevel() runs an iterative biquad-design loop only when the value
+//     actually changes; passing the same value repeatedly is effectively free,
+//     so it is safe to call once per processBlock with the current parameter.
 //
 // Limitations (v0.1):
 //   - Single phon parameter, no separate playback/reference contour.

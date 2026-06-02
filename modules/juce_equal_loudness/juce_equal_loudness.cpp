@@ -153,7 +153,16 @@ void EqualLoudnessProcessor::reset() noexcept
 
 void EqualLoudnessProcessor::setPhonLevel (float phon) noexcept
 {
-    phonLevel_ = juce::jlimit (ISO226::minPhon, ISO226::maxPhon, phon);
+    // Guard against redundant calls. updateFilters() runs an iterative
+    // biquad-design loop that is far too expensive to invoke on every audio
+    // block; without this early return a caller that naively writes the
+    // current parameter value every block (the common pattern) will overload
+    // the audio thread.
+    const float clamped = juce::jlimit (ISO226::minPhon, ISO226::maxPhon, phon);
+    if (clamped == phonLevel_)
+        return;
+
+    phonLevel_ = clamped;
     if (sampleRate_ > 0.0)
         updateFilters();
 }
