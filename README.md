@@ -5,7 +5,7 @@
 A small JUCE module that applies real-time equal-loudness compensation based
 on the ISO 226:2003 standard.
 
-**Status: v0.1.** See [Scope and limitations](#scope-and-limitations) before
+**Status: v0.1.1** See [Scope and limitations](#scope-and-limitations) before
 depending on it.
 
 ## Why this exists
