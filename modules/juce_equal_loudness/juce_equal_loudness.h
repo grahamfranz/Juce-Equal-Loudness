@@ -5,7 +5,7 @@
 
     ID:                 juce_equal_loudness
     vendor:             Graham Franz
-    version:            0.1.1
+    version:            0.2.0
     name:               JUCE Equal Loudness
     description:        Real-time ISO 226:2003 equal-loudness compensation via an IIR peaking-filter cascade.
     website:            https://github.com/grahamfranz/Juce-Equal-Loudness
@@ -97,18 +97,24 @@ struct ISO226
 // that phon level.
 //
 // Real-time safety:
-//   - prepare() is the only function that allocates. process(), reset(), and
-//     setPhonLevel() do not.
+//   - prepare() is the only function that allocates. It also precomputes a
+//     lookup table of converged per-band gains across the ISO 226 phon range,
+//     so the iterative biquad-design loop never runs on the audio thread.
+//   - process(), reset(), and setPhonLevel() do not allocate.
 //   - The filter cascade has a fixed size (numBiquads). Changing the phon
 //     level updates coefficients in place; it does not resize.
-//   - setPhonLevel() runs an iterative biquad-design loop only when the value
-//     actually changes; passing the same value repeatedly is effectively free,
-//     so it is safe to call once per processBlock with the current parameter.
+//   - setPhonLevel() is cheap: it stores the target and lets the internal
+//     linear smoother ramp toward it across subsequent process() calls.
 //
-// Limitations (v0.1):
+// Parameter smoothing:
+//   - Phon changes are ramped over ~50 ms by a linear smoother. Inside
+//     process(), the block is split into small sub-blocks; at each sub-block
+//     boundary the smoothed phon is looked up in the gain LUT and the 8
+//     biquads are redesigned from the interpolated gains. This avoids the
+//     audible click that a step change in coefficients would produce.
+//
+// Limitations:
 //   - Single phon parameter, no separate playback/reference contour.
-//   - No parameter smoothing: changing phon during playback may produce an
-//     audible click. Call from the message thread or smooth externally.
 //   - float samples only.
 //==============================================================================
 class EqualLoudnessProcessor
@@ -134,16 +140,46 @@ public:
     float gainAtFrequency (float frequency) const noexcept;
 
     struct BiquadCoeffs { float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0; };
-    struct BiquadState  { float z1 = 0, z2 = 0; };
+
+    // Direct Form I state: two past inputs and two past outputs. DF-I is used
+    // (rather than the more memory-efficient DF-II) because its state is
+    // coefficient-independent — past signal samples, not coefficient-scaled
+    // intermediates. That makes it the standard choice for time-varying
+    // biquads: as setPhonLevel() ramps and updateCoefficientsFromGains()
+    // rewrites coefficients per sub-block, DF-I avoids the subtle "zipper"
+    // transients DF-II produces when its z-state is reinterpreted under new
+    // coefficients.
+    struct BiquadState  { float x1 = 0, x2 = 0, y1 = 0, y2 = 0; };
 
 private:
-    void updateFilters() noexcept;
+    // Sub-block size used for parameter smoothing inside process(). The block
+    // is split into chunks of this many samples; at each chunk boundary the
+    // smoothed phon is advanced and the cascade is redesigned from the LUT.
+    // ~32 samples ≈ 0.7 ms at 48 kHz — well below the click-audibility
+    // threshold with DF-I biquads, and cheap enough to redesign 8 biquads
+    // per chunk. Redesign is skipped entirely when the smoother is settled.
+    static constexpr int smoothingChunkSize = 32;
+
+    // LUT covers integer phon values across the ISO 226 validated range.
+    static constexpr int numLutEntries =
+        (int) (ISO226::maxPhon - ISO226::minPhon) + 1;
+
+    std::array<float, numBiquads> gainsForPhon (float phon) const noexcept;
+    void updateCoefficientsFromGains (const std::array<float, numBiquads>& gainsDb) noexcept;
 
     float phonLevel_ = 60.0f;
     double sampleRate_ = 0.0;
 
     std::array<BiquadCoeffs, numBiquads> coeffs_ {};
     std::vector<std::array<BiquadState, numBiquads>> state_;
+
+    // Each LUT entry holds the converged per-band gain (dB) that the
+    // iterative residual-correction loop produces for that phon level. At
+    // runtime we just lerp between the two bracketing entries and redesign
+    // the 8 biquads from those gains — no iteration on the audio thread.
+    std::array<std::array<float, numBiquads>, numLutEntries> gainLut_ {};
+
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> phonSmoother_;
 };
 
 } // namespace juce_equal_loudness

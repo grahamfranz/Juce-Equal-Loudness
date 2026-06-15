@@ -129,6 +129,69 @@ namespace
             magSq *= biquadMagSq (c, w);
         return (float) (10.0 * std::log10 (magSq));
     }
+
+    // Iterative residual correction. Given a phon level and sample rate,
+    // return the 8 converged per-band gains (dB) that the cascade should be
+    // designed with so the realised response sits within ~0.05 dB of the
+    // analytic ISO 226 target at each design frequency.
+    //
+    // A naive independent-per-band fit overshoots between design frequencies
+    // because each peaking filter's skirts contribute gain at its neighbours'
+    // centre frequencies, and that crosstalk adds up. We compensate by
+    // repeatedly measuring the realised cascade response at each design
+    // frequency, subtracting from the target, and folding the residual back
+    // into the filter gain.
+    std::array<float, EqualLoudnessProcessor::numBiquads>
+    solveCascadeGains (float phon, double sampleRate) noexcept
+    {
+        constexpr int numBiquads = EqualLoudnessProcessor::numBiquads;
+
+        std::array<float, numBiquads> targetDb {};
+        for (int i = 0; i < numBiquads; ++i)
+            targetDb[(size_t) i] = ISO226::splAtFrequency (designFrequencies[(size_t) i], phon) - phon;
+
+        std::array<EqualLoudnessProcessor::BiquadCoeffs, numBiquads> coeffs {};
+        std::array<float, numBiquads> filterGainDb = targetDb;
+
+        auto redesign = [&]
+        {
+            for (int i = 0; i < numBiquads; ++i)
+                coeffs[(size_t) i] = designPeakingFilter (designFrequencies[(size_t) i],
+                                                          filterGainDb[(size_t) i],
+                                                          designQ,
+                                                          sampleRate);
+        };
+
+        redesign();
+
+        // Damping factor < 1 trades convergence speed for stability. At full
+        // strength (1.0) the iteration overshoots when target gains are large
+        // (e.g. +30 dB at 50 Hz, low phon levels): the corrected coefficients
+        // produce deep notches elsewhere in the cascade, the realised response
+        // collapses, and the next residual blows up. 0.5 converges in ~15
+        // iterations and stays well-behaved over the full ISO 226 phon range.
+        constexpr int   maxIterations = 20;
+        constexpr float damping       = 0.5f;
+        constexpr float convergenceDb = 0.05f;
+
+        for (int iter = 0; iter < maxIterations; ++iter)
+        {
+            float maxResidual = 0.0f;
+            for (int i = 0; i < numBiquads; ++i)
+            {
+                const float realisedDb = cascadeGainDb (coeffs,
+                                                        designFrequencies[(size_t) i],
+                                                        sampleRate);
+                const float residual = targetDb[(size_t) i] - realisedDb;
+                filterGainDb[(size_t) i] += damping * residual;
+                maxResidual = juce::jmax (maxResidual, std::abs (residual));
+            }
+            redesign();
+            if (maxResidual < convergenceDb) break;
+        }
+
+        return filterGainDb;
+    }
 }
 
 //==============================================================================
@@ -140,7 +203,26 @@ void EqualLoudnessProcessor::prepare (const juce::dsp::ProcessSpec& spec)
 {
     sampleRate_ = spec.sampleRate;
     state_.assign ((size_t) spec.numChannels, {});
-    updateFilters();
+
+    // Precompute the converged per-band gains for every integer phon level
+    // in the ISO 226 validated range. The iterative residual-correction loop
+    // is sample-rate dependent (it measures the realised cascade response),
+    // so the LUT is rebuilt whenever prepare() is called. ~71 entries × 8
+    // floats ≈ 2 KB; iteration cost is bounded and one-shot.
+    for (int i = 0; i < numLutEntries; ++i)
+    {
+        const float phon = ISO226::minPhon + (float) i;
+        gainLut_[(size_t) i] = solveCascadeGains (phon, sampleRate_);
+    }
+
+    // Smoother is advanced once per smoothingChunkSize samples inside
+    // process(), so its "sample rate" is the chunk rate, not the audio rate.
+    // 0.05 s ramp is short enough to feel responsive and long enough to be
+    // inaudible for the size of coefficient deltas the LUT lerp produces.
+    phonSmoother_.reset (sampleRate_ / (double) smoothingChunkSize, 0.05);
+    phonSmoother_.setCurrentAndTargetValue (phonLevel_);
+
+    updateCoefficientsFromGains (gainsForPhon (phonLevel_));
     reset();
 }
 
@@ -153,72 +235,37 @@ void EqualLoudnessProcessor::reset() noexcept
 
 void EqualLoudnessProcessor::setPhonLevel (float phon) noexcept
 {
-    // Guard against redundant calls. updateFilters() runs an iterative
-    // biquad-design loop that is far too expensive to invoke on every audio
-    // block; without this early return a caller that naively writes the
-    // current parameter value every block (the common pattern) will overload
-    // the audio thread.
-    const float clamped = juce::jlimit (ISO226::minPhon, ISO226::maxPhon, phon);
-    if (clamped == phonLevel_)
-        return;
-
-    phonLevel_ = clamped;
-    if (sampleRate_ > 0.0)
-        updateFilters();
+    phonLevel_ = juce::jlimit (ISO226::minPhon, ISO226::maxPhon, phon);
+    phonSmoother_.setTargetValue (phonLevel_);
 }
 
-void EqualLoudnessProcessor::updateFilters() noexcept
+std::array<float, EqualLoudnessProcessor::numBiquads>
+EqualLoudnessProcessor::gainsForPhon (float phon) const noexcept
 {
-    // The cascade design is iterative residual correction. A naive
-    // independent-per-band fit overshoots between design frequencies because
-    // each peaking filter's skirts contribute gain at its neighbours' centre
-    // frequencies, and that crosstalk adds up. We compensate by repeatedly
-    // measuring the realised cascade response at each design frequency,
-    // subtracting from the target, and folding the residual back into the
-    // filter gain.
-    std::array<float, numBiquads> targetDb {};
+    const float clamped = juce::jlimit (ISO226::minPhon, ISO226::maxPhon, phon);
+    const float pos     = clamped - ISO226::minPhon;
+    const int   lo      = juce::jlimit (0, numLutEntries - 1, (int) pos);
+    const int   hi      = juce::jmin (lo + 1, numLutEntries - 1);
+    const float t       = pos - (float) lo;
+
+    std::array<float, numBiquads> gains {};
     for (int i = 0; i < numBiquads; ++i)
-        targetDb[(size_t) i] = ISO226::splAtFrequency (designFrequencies[(size_t) i],
-                                                       phonLevel_) - phonLevel_;
-
-    std::array<float, numBiquads> filterGainDb = targetDb;
-
-    auto redesign = [this, &filterGainDb]
     {
-        for (int i = 0; i < numBiquads; ++i)
-            coeffs_[(size_t) i] = designPeakingFilter (designFrequencies[(size_t) i],
-                                                       filterGainDb[(size_t) i],
-                                                       designQ,
-                                                       sampleRate_);
-    };
-
-    redesign();
-
-    // Damping factor < 1 trades convergence speed for stability. At full
-    // strength (1.0) the iteration overshoots when target gains are large
-    // (e.g. +30 dB at 50 Hz, low phon levels): the corrected coefficients
-    // produce deep notches elsewhere in the cascade, the realised response
-    // collapses, and the next residual blows up. 0.5 converges in ~15
-    // iterations and stays well-behaved over the full ISO 226 phon range.
-    constexpr int   maxIterations = 20;
-    constexpr float damping       = 0.5f;
-    constexpr float convergenceDb = 0.05f;
-
-    for (int iter = 0; iter < maxIterations; ++iter)
-    {
-        float maxResidual = 0.0f;
-        for (int i = 0; i < numBiquads; ++i)
-        {
-            const float realisedDb = cascadeGainDb (coeffs_,
-                                                    designFrequencies[(size_t) i],
-                                                    sampleRate_);
-            const float residual = targetDb[(size_t) i] - realisedDb;
-            filterGainDb[(size_t) i] += damping * residual;
-            maxResidual = juce::jmax (maxResidual, std::abs (residual));
-        }
-        redesign();
-        if (maxResidual < convergenceDb) break;
+        const float a = gainLut_[(size_t) lo][(size_t) i];
+        const float b = gainLut_[(size_t) hi][(size_t) i];
+        gains[(size_t) i] = a + t * (b - a);
     }
+    return gains;
+}
+
+void EqualLoudnessProcessor::updateCoefficientsFromGains (
+    const std::array<float, numBiquads>& gainsDb) noexcept
+{
+    for (int i = 0; i < numBiquads; ++i)
+        coeffs_[(size_t) i] = designPeakingFilter (designFrequencies[(size_t) i],
+                                                   gainsDb[(size_t) i],
+                                                   designQ,
+                                                   sampleRate_);
 }
 
 float EqualLoudnessProcessor::gainAtFrequency (float frequency) const noexcept
@@ -237,30 +284,51 @@ void EqualLoudnessProcessor::process (juce::dsp::AudioBlock<float> block) noexce
                                                   (int) state_.size());
     const auto numSamples  = block.getNumSamples();
 
-    for (size_t ch = 0; ch < numChannels; ++ch)
+    // Split the block into small sub-blocks; at each boundary advance the
+    // phon smoother by one "tick" (= smoothingChunkSize audio samples worth)
+    // and rebuild the cascade from the LUT. While the smoother is not
+    // ramping we skip the redesign entirely.
+    size_t pos = 0;
+    while (pos < numSamples)
     {
-        auto* samples = block.getChannelPointer (ch);
-        auto& channelState = state_[ch];
+        const size_t chunk = juce::jmin (numSamples - pos, (size_t) smoothingChunkSize);
 
-        for (size_t n = 0; n < numSamples; ++n)
+        if (phonSmoother_.isSmoothing())
         {
-            float x = samples[n];
-
-            for (int i = 0; i < numBiquads; ++i)
-            {
-                const auto& c = coeffs_[(size_t) i];
-                auto& s = channelState[(size_t) i];
-
-                // Direct Form II, transposed-friendly variant.
-                const float w = x - c.a1 * s.z1 - c.a2 * s.z2;
-                const float y = c.b0 * w + c.b1 * s.z1 + c.b2 * s.z2;
-                s.z2 = s.z1;
-                s.z1 = w;
-                x = y;
-            }
-
-            samples[n] = x;
+            const float smoothedPhon = phonSmoother_.getNextValue();
+            updateCoefficientsFromGains (gainsForPhon (smoothedPhon));
         }
+
+        for (size_t ch = 0; ch < numChannels; ++ch)
+        {
+            auto* samples = block.getChannelPointer (ch) + pos;
+            auto& channelState = state_[ch];
+
+            for (size_t n = 0; n < chunk; ++n)
+            {
+                float x = samples[n];
+
+                for (int i = 0; i < numBiquads; ++i)
+                {
+                    const auto& c = coeffs_[(size_t) i];
+                    auto& s = channelState[(size_t) i];
+
+                    // Direct Form I: state is past signal samples, not
+                    // coefficient-scaled intermediates, so coefficient updates
+                    // between samples do not perturb the state's meaning. See
+                    // the BiquadState comment in the header.
+                    const float y = c.b0 * x  + c.b1 * s.x1 + c.b2 * s.x2
+                                              - c.a1 * s.y1 - c.a2 * s.y2;
+                    s.x2 = s.x1; s.x1 = x;
+                    s.y2 = s.y1; s.y1 = y;
+                    x = y;
+                }
+
+                samples[n] = x;
+            }
+        }
+
+        pos += chunk;
     }
 }
 
