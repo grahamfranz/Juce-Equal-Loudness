@@ -5,7 +5,7 @@
 A small JUCE module that applies real-time equal-loudness compensation based
 on the ISO 226:2003 standard.
 
-**Status: v0.1.1** See [Scope and limitations](#scope-and-limitations) before
+**Status: v0.2.0** See [Scope and limitations](#scope-and-limitations) before
 depending on it.
 
 ## Why this exists
@@ -89,18 +89,25 @@ void prepareToPlay (double sampleRate, int samplesPerBlock) override
 
 void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
 {
+    loudness.setPhonLevel (currentPhonParam); // safe to call every block
     loudness.process (buffer);
 }
 ```
+
+`setPhonLevel` only stores the target; the cascade ramps toward it over
+~50 ms inside `process()`, using a precomputed gain LUT built in
+`prepare()`. The iterative biquad solver never runs on the audio thread.
 
 ## Scope and limitations
 
 This is a small first release. Known limitations:
 
-- **No parameter smoothing.** Changing `setPhonLevel` during playback may
-  produce an audible click as the biquad coefficients jump. Either change
-  the parameter only between blocks from the message thread, or smooth it
-  externally and call once per block.
+- **Fixed 50 ms ramp.** The internal phon smoother is hardcoded to a 50 ms
+  linear ramp. That's fast enough to feel responsive and slow enough to
+  hide coefficient-update artifacts, but it isn't configurable yet. On
+  signals with sustained low-frequency content, dragging the parameter
+  continuously will audibly amplitude-modulate the bass as the contour
+  sweeps — automate to a target or smooth at the UI layer if that matters.
 - **One direction.** Applies the inverse equal-loudness contour. There is no
   "reference vs target" mode and no flatten/inverse switch.
 - **`float` samples only.** `double` is not supported.
